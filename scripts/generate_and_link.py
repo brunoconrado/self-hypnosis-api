@@ -56,6 +56,18 @@ def sanitize_filename(text, max_length=50):
     return text
 
 
+def get_category_slug(category_name):
+    """Convert category name to URL-friendly slug"""
+    slugs = {
+        'Financeiro': 'financeiro',
+        'Saúde': 'saude',
+        'Sono': 'sono',
+        'Autoestima': 'autoestima',
+        'Produtividade': 'produtividade'
+    }
+    return slugs.get(category_name, category_name.lower())
+
+
 def generate_for_category(elevenlabs, voice_id, category_name, count=None):
     """Generate audio for affirmations in a category"""
 
@@ -72,8 +84,11 @@ def generate_for_category(elevenlabs, voice_id, category_name, count=None):
             print(f"   Available: {[c['name'] for c in categories]}")
             return 0
 
-        # Get affirmations for this category
-        affirmations = AffirmationModel.get_by_category(category['id'])
+        # Get category slug for folder structure
+        category_slug = get_category_slug(category['name'])
+
+        # Get affirmations for this category (with voice_id to check existing audio)
+        affirmations = AffirmationModel.get_by_category(category['id'], voice_id=voice_id)
 
         if count:
             affirmations = affirmations[:count]
@@ -83,9 +98,9 @@ def generate_for_category(elevenlabs, voice_id, category_name, count=None):
 
         generated = 0
         for i, aff in enumerate(affirmations):
-            # Skip if already has audio
-            if aff.get('default_audio_url'):
-                print(f"  [{i+1}/{len(affirmations)}] ⏭️  Already has audio")
+            # Skip if already has audio for this voice
+            if AffirmationModel.has_audio_for_voice(aff['id'], voice_id):
+                print(f"  [{i+1}/{len(affirmations)}] ⏭️  Already has audio for this voice")
                 continue
 
             try:
@@ -98,18 +113,21 @@ def generate_for_category(elevenlabs, voice_id, category_name, count=None):
                     voice_id=voice_id
                 )
 
-                # Create filename from affirmation text
+                # Create path: voices/{voice_id}/affirmations/{category}/{filename}.mp3
                 filename = sanitize_filename(text) + '.mp3'
+                relative_path = f"voices/{voice_id}/affirmations/{category_slug}/{filename}"
 
-                # Save to storage
+                # Save to storage (with nested path)
                 audio_file = io.BytesIO(audio_bytes)
-                audio_path = storage.save_audio(audio_file, filename, 'audio/mpeg', preserve_filename=True)
+                audio_path = storage.save_audio(audio_file, relative_path, 'audio/mpeg', preserve_filename=True)
                 audio_url = storage.get_audio_url(audio_path)
 
-                # Update affirmation in database
-                db.affirmations.update_one(
-                    {'_id': ObjectId(aff['id'])},
-                    {'$set': {'default_audio_url': audio_url, 'audio_path': audio_path}}
+                # Update affirmation in database using new multi-voice structure
+                AffirmationModel.set_audio_for_voice(
+                    affirmation_id=aff['id'],
+                    voice_id=voice_id,
+                    path=audio_path,
+                    url=audio_url
                 )
 
                 print(f"✓")
@@ -125,8 +143,12 @@ def generate_for_category(elevenlabs, voice_id, category_name, count=None):
         return generated
 
 
-def link_existing_files():
-    """Link existing audio files in storage to affirmations in database"""
+def link_existing_files(voice_id=None):
+    """Link existing audio files in storage to affirmations in database
+
+    Args:
+        voice_id: ElevenLabs voice ID. If provided, links files in voices/{voice_id}/ structure
+    """
 
     with app.app_context():
         storage = get_storage()
@@ -139,9 +161,16 @@ def link_existing_files():
             print(f"❌ Storage path not found: {storage_path}")
             return 0
 
-        # Get all mp3 files
-        audio_files = list(storage_path.glob('*.mp3'))
-        print(f"\n🔍 Found {len(audio_files)} audio files in storage")
+        # Find audio files based on structure
+        if voice_id:
+            # New structure: voices/{voice_id}/affirmations/{category}/*.mp3
+            voice_path = storage_path / 'voices' / voice_id / 'affirmations'
+            audio_files = list(voice_path.glob('**/*.mp3'))
+            print(f"\n🔍 Found {len(audio_files)} audio files for voice {voice_id}")
+        else:
+            # Legacy flat structure
+            audio_files = [f for f in storage_path.glob('*.mp3') if 'voices' not in str(f)]
+            print(f"\n🔍 Found {len(audio_files)} audio files in flat storage")
 
         if not audio_files:
             return 0
@@ -165,20 +194,35 @@ def link_existing_files():
             if filename in aff_map:
                 aff = aff_map[filename]
 
-                # Skip if already linked
-                if aff.get('default_audio_url'):
-                    print(f"⏭️  {filename[:40]}... (already linked)")
-                    continue
+                if voice_id:
+                    # Check if already has audio for this voice
+                    audio_data = aff.get('audio', {}).get(voice_id)
+                    if audio_data and audio_data.get('path'):
+                        print(f"⏭️  {filename[:40]}... (already linked)")
+                        continue
 
-                # Get audio URL
-                audio_path = audio_file.name
-                audio_url = storage.get_audio_url(audio_path)
+                    # Calculate relative path from storage root
+                    relative_path = str(audio_file.relative_to(storage_path))
+                    audio_url = storage.get_audio_url(relative_path)
 
-                # Update database
-                db.affirmations.update_one(
-                    {'_id': aff['_id']},
-                    {'$set': {'default_audio_url': audio_url, 'audio_path': audio_path}}
-                )
+                    # Update database with new structure
+                    db.affirmations.update_one(
+                        {'_id': aff['_id']},
+                        {'$set': {f'audio.{voice_id}': {'path': relative_path, 'url': audio_url}}}
+                    )
+                else:
+                    # Legacy: check default_audio_url
+                    if aff.get('default_audio_url'):
+                        print(f"⏭️  {filename[:40]}... (already linked)")
+                        continue
+
+                    audio_path = audio_file.name
+                    audio_url = storage.get_audio_url(audio_path)
+
+                    db.affirmations.update_one(
+                        {'_id': aff['_id']},
+                        {'$set': {'default_audio_url': audio_url, 'audio_path': audio_path}}
+                    )
 
                 print(f"✓ Linked: {filename[:40]}...")
                 linked += 1
@@ -198,10 +242,11 @@ def main():
 
     args = parser.parse_args()
 
-    # Handle --link-existing first (doesn't need voice-id or API key)
+    # Handle --link-existing
     if args.link_existing:
         print("\n🔗 Linking existing audio files to database...")
-        linked = link_existing_files()
+        # If voice-id provided, link files in voice structure; otherwise link flat files
+        linked = link_existing_files(voice_id=args.voice_id)
         print(f"\n{'='*50}")
         print(f"✅ Total linked: {linked}")
         return
@@ -209,6 +254,10 @@ def main():
     # For generation, voice-id is required
     if not args.voice_id:
         print("❌ --voice-id is required for generation")
+        print("\n💡 Usage examples:")
+        print("   python scripts/generate_and_link.py --voice-id YOUR_VOICE_ID --all")
+        print("   python scripts/generate_and_link.py --voice-id YOUR_VOICE_ID --category Financeiro")
+        print("   python scripts/generate_and_link.py --link-existing --voice-id YOUR_VOICE_ID")
         return
 
     api_key = os.getenv('ELEVENLABS_API_KEY')
@@ -219,6 +268,7 @@ def main():
     elevenlabs = ElevenLabsService(api_key)
 
     print(f"\n🎤 Voice ID: {args.voice_id}")
+    print(f"📁 Audio path: voices/{args.voice_id}/affirmations/{{category}}/")
 
     total_generated = 0
 
@@ -246,8 +296,8 @@ def main():
 
     print(f"\n{'='*50}")
     print(f"✅ Total generated: {total_generated}")
-    print(f"\n💡 Audio is now linked in the database!")
-    print(f"   Fetch affirmations from API to see audio URLs")
+    print(f"\n💡 Audio files saved to: voices/{args.voice_id}/affirmations/")
+    print(f"   Database updated with new audio.{args.voice_id} field")
 
 
 if __name__ == '__main__':

@@ -73,27 +73,66 @@ class AffirmationModel:
         return get_db()[cls.collection_name]
 
     @classmethod
-    def get_all(cls) -> List[dict]:
-        """Get all system affirmations"""
+    def get_all(cls, voice_id: str = None) -> List[dict]:
+        """Get all system affirmations, optionally with audio for specific voice"""
         affirmations = cls.collection().find().sort([('category_id', 1), ('order', 1)])
-        return [cls._serialize(a) for a in affirmations]
+        return [cls._serialize(a, voice_id) for a in affirmations]
 
     @classmethod
-    def get_by_category(cls, category_id: str) -> List[dict]:
+    def get_by_category(cls, category_id: str, voice_id: str = None) -> List[dict]:
         """Get affirmations by category"""
         affirmations = cls.collection().find(
             {'category_id': ObjectId(category_id)}
         ).sort('order', 1)
-        return [cls._serialize(a) for a in affirmations]
+        return [cls._serialize(a, voice_id) for a in affirmations]
 
     @classmethod
-    def find_by_id(cls, affirmation_id: str) -> Optional[dict]:
+    def find_by_id(cls, affirmation_id: str, voice_id: str = None) -> Optional[dict]:
         """Find affirmation by ID"""
         try:
             affirmation = cls.collection().find_one({'_id': ObjectId(affirmation_id)})
-            return cls._serialize(affirmation) if affirmation else None
+            return cls._serialize(affirmation, voice_id) if affirmation else None
         except Exception:
             return None
+
+    @classmethod
+    def get_audio_for_voice(cls, affirmation_id: str, voice_id: str) -> Optional[dict]:
+        """Get audio data for a specific voice"""
+        try:
+            affirmation = cls.collection().find_one({'_id': ObjectId(affirmation_id)})
+            if not affirmation:
+                return None
+            audio_map = affirmation.get('audio', {})
+            return audio_map.get(voice_id)
+        except Exception:
+            return None
+
+    @classmethod
+    def set_audio_for_voice(cls, affirmation_id: str, voice_id: str,
+                            path: str, url: str, duration_ms: int = None) -> bool:
+        """Set audio for a specific voice on an affirmation"""
+        try:
+            audio_data = {
+                'path': path,
+                'url': url,
+                'generated_at': datetime.utcnow()
+            }
+            if duration_ms:
+                audio_data['duration_ms'] = duration_ms
+
+            result = cls.collection().update_one(
+                {'_id': ObjectId(affirmation_id)},
+                {'$set': {f'audio.{voice_id}': audio_data}}
+            )
+            return result.modified_count > 0
+        except Exception:
+            return False
+
+    @classmethod
+    def has_audio_for_voice(cls, affirmation_id: str, voice_id: str) -> bool:
+        """Check if affirmation has audio for a specific voice"""
+        audio = cls.get_audio_for_voice(affirmation_id, voice_id)
+        return audio is not None and audio.get('path') is not None
 
     @classmethod
     def seed_defaults(cls, categories: List[dict]):
@@ -117,7 +156,8 @@ class AffirmationModel:
                     'category_id': ObjectId(category_id),
                     'text': text,
                     'order': idx,
-                    'default_audio_url': None  # To be populated with ElevenLabs
+                    'audio': {},  # Multi-voice audio map
+                    'default_audio_url': None  # Deprecated, kept for backward compat
                 }
                 for idx, text in enumerate(texts)
             ]
@@ -126,14 +166,31 @@ class AffirmationModel:
                 cls.collection().insert_many(affirmations)
 
     @classmethod
-    def _serialize(cls, affirmation: dict) -> dict:
+    def _serialize(cls, affirmation: dict, voice_id: str = None) -> dict:
         if not affirmation:
             return None
+
+        # Get audio for requested voice (or None)
+        audio_map = affirmation.get('audio', {})
+        voice_audio = audio_map.get(voice_id) if voice_id else None
+
+        # Determine audio URL: prefer voice-specific, fallback to legacy default_audio_url
+        if voice_audio and voice_audio.get('url'):
+            audio_url = voice_audio['url']
+            audio_duration_ms = voice_audio.get('duration_ms')
+        else:
+            audio_url = affirmation.get('default_audio_url')
+            audio_duration_ms = None
+
         return {
             'id': str(affirmation['_id']),
             'category_id': str(affirmation['category_id']),
             'text': affirmation['text'],
             'order': affirmation.get('order', 0),
+            'audio_url': audio_url,
+            'audio_duration_ms': audio_duration_ms,
+            'audio': audio_map,  # Full audio map for reference
+            # Deprecated fields (backward compat)
             'default_audio_url': affirmation.get('default_audio_url')
         }
 
@@ -152,14 +209,19 @@ class UserAffirmationModel:
         return get_db()[cls.collection_name]
 
     @classmethod
-    def get_user_affirmations(cls, user_id: str) -> List[dict]:
-        """Get all affirmations for a user (merged with system defaults)"""
+    def get_user_affirmations(cls, user_id: str, voice_id: str = None) -> List[dict]:
+        """Get all affirmations for a user (merged with system defaults)
+
+        Args:
+            user_id: User's MongoDB ID
+            voice_id: ElevenLabs voice ID for system audio. If None, uses legacy default_audio_url
+        """
         # Get user's customizations
         user_affs = list(cls.collection().find({'user_id': ObjectId(user_id)}))
         user_aff_map = {str(ua.get('affirmation_id')): ua for ua in user_affs if ua.get('affirmation_id')}
 
-        # Get system affirmations
-        system_affs = AffirmationModel.get_all()
+        # Get system affirmations with voice-specific audio
+        system_affs = AffirmationModel.get_all(voice_id=voice_id)
 
         result = []
         for sys_aff in system_affs:
@@ -167,9 +229,16 @@ class UserAffirmationModel:
 
             if user_aff:
                 # Merge user customization with system affirmation
-                # Use user's custom audio if available, otherwise fall back to system default
+                # Priority: user's custom audio > system voice audio > legacy default
                 user_audio_url = cls._get_audio_url(user_aff)
-                audio_url = user_audio_url or sys_aff.get('default_audio_url')
+                if user_audio_url:
+                    audio_url = user_audio_url
+                    audio_source = user_aff.get('audio_source', cls.AUDIO_SOURCE_SYSTEM)
+                    audio_duration_ms = user_aff.get('audio_duration_ms')
+                else:
+                    audio_url = sys_aff.get('audio_url')
+                    audio_source = cls.AUDIO_SOURCE_SYSTEM
+                    audio_duration_ms = sys_aff.get('audio_duration_ms')
 
                 result.append({
                     'id': sys_aff['id'],
@@ -179,8 +248,8 @@ class UserAffirmationModel:
                     'enabled': user_aff.get('enabled', True),
                     'order': user_aff.get('order', sys_aff['order']),
                     'audio_url': audio_url,
-                    'audio_source': user_aff.get('audio_source', cls.AUDIO_SOURCE_SYSTEM) if user_audio_url else cls.AUDIO_SOURCE_SYSTEM,
-                    'audio_duration_ms': user_aff.get('audio_duration_ms'),
+                    'audio_source': audio_source,
+                    'audio_duration_ms': audio_duration_ms,
                     'is_custom': False
                 })
             else:
@@ -192,9 +261,9 @@ class UserAffirmationModel:
                     'text': sys_aff['text'],
                     'enabled': True,
                     'order': sys_aff['order'],
-                    'audio_url': sys_aff.get('default_audio_url'),
+                    'audio_url': sys_aff.get('audio_url'),
                     'audio_source': cls.AUDIO_SOURCE_SYSTEM,
-                    'audio_duration_ms': None,
+                    'audio_duration_ms': sys_aff.get('audio_duration_ms'),
                     'is_custom': False
                 })
 

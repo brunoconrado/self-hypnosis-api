@@ -6,8 +6,28 @@ from flask import Blueprint, request, jsonify
 from flask_jwt_extended import jwt_required, get_jwt_identity
 
 from app.services.elevenlabs import get_elevenlabs
+from app.models import VoiceModel, UserModel
 
 voices_bp = Blueprint('voices', __name__, url_prefix='/api/voices')
+
+
+@voices_bp.route('/configured', methods=['GET'])
+@jwt_required()
+def list_configured_voices():
+    """List configured voices available in the system (voices with generated audio)"""
+    user_id = get_jwt_identity()
+    user = UserModel.find_by_id(user_id)
+
+    voices = VoiceModel.get_all(active_only=True)
+
+    # For free users, only show default voice
+    if not user or user.get('plan') != 'premium':
+        voices = [v for v in voices if v.get('is_default')]
+
+    return jsonify({
+        'voices': voices,
+        'default_voice_id': VoiceModel.get_default_voice_id()
+    })
 
 
 @voices_bp.route('', methods=['GET'])

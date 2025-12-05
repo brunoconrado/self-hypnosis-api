@@ -43,24 +43,34 @@ class LocalStorageBackend(StorageBackend):
         self.base_path.mkdir(parents=True, exist_ok=True)
 
     def save(self, file_data: BinaryIO, filename: str, content_type: str, preserve_filename: bool = False) -> str:
-        """Save file to local filesystem"""
+        """Save file to local filesystem
+
+        Args:
+            file_data: File binary data
+            filename: Can be just a filename or a path like 'voices/abc123/affirmations/financeiro/file.mp3'
+            content_type: MIME type
+            preserve_filename: If True, keep the full path structure
+        """
         ext = Path(filename).suffix or self._get_extension(content_type)
 
         if preserve_filename:
-            # Use the provided filename directly (flat structure)
-            safe_filename = Path(filename).name
+            # Use the provided path directly (supports nested directories)
+            relative_path = Path(filename)
         else:
-            # Generate unique filename
-            safe_filename = f"{uuid.uuid4().hex}{ext}"
+            # Generate unique filename (flat)
+            relative_path = Path(f"{uuid.uuid4().hex}{ext}")
 
-        file_path = self.base_path / safe_filename
+        file_path = self.base_path / relative_path
+
+        # Create parent directories if they don't exist
+        file_path.parent.mkdir(parents=True, exist_ok=True)
 
         # Write file
         with open(file_path, 'wb') as f:
             f.write(file_data.read())
 
-        # Return just the filename
-        return safe_filename
+        # Return the relative path (preserves directory structure)
+        return str(relative_path)
 
     def delete(self, file_path: str) -> bool:
         """Delete file from local filesystem"""
@@ -114,16 +124,24 @@ class S3StorageBackend(StorageBackend):
         )
 
     def save(self, file_data: BinaryIO, filename: str, content_type: str, preserve_filename: bool = False) -> str:
-        """Save file to S3"""
+        """Save file to S3
+
+        Args:
+            file_data: File binary data
+            filename: Can be just a filename or a path like 'voices/abc123/affirmations/financeiro/file.mp3'
+            content_type: MIME type
+            preserve_filename: If True, keep the full path structure
+        """
         ext = Path(filename).suffix or self._get_extension(content_type)
 
         if preserve_filename:
-            safe_filename = Path(filename).name
+            # Use the provided path directly (supports nested structure)
+            relative_path = filename
         else:
-            safe_filename = f"{uuid.uuid4().hex}{ext}"
+            relative_path = f"{uuid.uuid4().hex}{ext}"
 
-        # Flat structure under audio/
-        key = f"audio/{safe_filename}"
+        # All audio under audio/ prefix
+        key = f"audio/{relative_path}"
 
         self.client.upload_fileobj(
             file_data,

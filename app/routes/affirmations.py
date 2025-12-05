@@ -6,7 +6,7 @@ from flask import Blueprint, request, jsonify
 from flask_jwt_extended import jwt_required, get_jwt_identity
 from marshmallow import Schema, fields, validate, ValidationError
 
-from app.models import UserModel, UserAffirmationModel, AffirmationModel, CategoryModel
+from app.models import UserModel, UserAffirmationModel, AffirmationModel, CategoryModel, VoiceModel
 
 affirmations_bp = Blueprint('affirmations', __name__, url_prefix='/api/affirmations')
 
@@ -24,15 +24,22 @@ class CustomAffirmationSchema(Schema):
 
 @affirmations_bp.route('/default', methods=['GET'])
 def get_default_affirmations():
-    """Get default system affirmations (public, no auth required)"""
-    affirmations = AffirmationModel.get_all()
+    """Get default system affirmations (public, no auth required)
+
+    Query params:
+        voice_id: ElevenLabs voice ID for audio URLs (optional, uses default if not provided)
+    """
+    voice_id = request.args.get('voice_id') or VoiceModel.get_default_voice_id()
+
+    affirmations = AffirmationModel.get_all(voice_id=voice_id)
     return jsonify([{
         'id': a['id'],
         'category_id': a['category_id'],
         'text': a['text'],
         'order': a['order'],
         'enabled': True,
-        'audio_url': a.get('default_audio_url'),
+        'audio_url': a.get('audio_url'),
+        'audio_duration_ms': a.get('audio_duration_ms'),
         'is_custom': False
     } for a in affirmations])
 
@@ -40,10 +47,34 @@ def get_default_affirmations():
 @affirmations_bp.route('', methods=['GET'])
 @jwt_required()
 def get_affirmations():
-    """Get all affirmations for user (merged with defaults)"""
+    """Get all affirmations for user (merged with defaults)
+
+    Query params:
+        voice_id: ElevenLabs voice ID for system audio (optional)
+                  Premium users can specify any configured voice
+                  Free users always get default voice
+    """
     user_id = get_jwt_identity()
-    affirmations = UserAffirmationModel.get_user_affirmations(user_id)
-    return jsonify(affirmations)
+    user = UserModel.find_by_id(user_id)
+
+    # Determine voice_id based on user's plan
+    requested_voice_id = request.args.get('voice_id')
+    default_voice_id = VoiceModel.get_default_voice_id()
+
+    if user and user.get('plan') == 'premium' and requested_voice_id:
+        # Premium users can choose any configured voice
+        voice_id = requested_voice_id
+    else:
+        # Free users get default voice
+        voice_id = default_voice_id
+
+    affirmations = UserAffirmationModel.get_user_affirmations(user_id, voice_id=voice_id)
+
+    return jsonify({
+        'affirmations': affirmations,
+        'voice_id': voice_id,
+        'is_default_voice': voice_id == default_voice_id
+    })
 
 
 @affirmations_bp.route('/<affirmation_id>', methods=['PUT'])
