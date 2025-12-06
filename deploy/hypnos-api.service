@@ -1,0 +1,17 @@
+[Unit]
+Description=Hypnos API (Gunicorn)
+After=network.target mongodb.service
+
+[Service]
+User=bruno
+Group=www-data
+WorkingDirectory=/home/bruno/hypnos
+Environment="PATH=/home/bruno/hypnos/venv/bin"
+EnvironmentFile=/home/bruno/hypnos/.env
+ExecStart=/home/bruno/hypnos/venv/bin/gunicorn --config gunicorn.conf.py run:app
+ExecReload=/bin/kill -s HUP $MAINPID
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
